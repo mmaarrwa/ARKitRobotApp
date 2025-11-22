@@ -4,13 +4,13 @@ import PackageDescription
 // We removed 'import AppleProductTypes' which caused the error
 
 let package = Package(
-    name: "ARKitPoseStreamer",
+    name: "ARKitRobotApp",
     platforms: [.iOS("16.0")],
     products: [
         // We changed '.iOSApplication' to '.executable'
         // This is the standard way to define an app in SPM
         .executable(
-            name: "ARKitPoseStreamer",
+            name: "ARKitRobotApp",
             targets: ["AppModule"]
         )
     ],

@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.mmaarrwa.ARKitPoseStreamer</string>
+    <string>com.mmaarrwa.ARKitRobotApp</string>
     <key>CFBundleName</key>
-    <string>ARKitPoseStreamer</string>
+    <string>ARKitRobotApp</string>
     <key>CFBundleExecutable</key>
-    <string>ARKitPoseStreamer</string>
+    <string>ARKitRobotApp</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
