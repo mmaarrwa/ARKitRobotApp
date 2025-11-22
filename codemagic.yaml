@@ -1,6 +1,6 @@
 workflows:
   ios-build:
-    name: ARKitPoseStreamer iOS Build
+    name: ARKitRobotApp iOS Build
     environment:
       xcode: latest
     scripts:
@@ -8,8 +8,8 @@ workflows:
         script: |
           # Build the executable
           xcodebuild archive \
-            -scheme "ARKitPoseStreamer" \
-            -archivePath "$CM_BUILD_DIR/ARKitPoseStreamer.xcarchive" \
+            -scheme "ARKitRobotApp" \
+            -archivePath "$CM_BUILD_DIR/ARKitRobotApp.xcarchive" \
             -destination "generic/platform=iOS"
 
       - name: Construct Manual .ipa
@@ -17,11 +17,11 @@ workflows:
           # Define paths
           IPA_DIR="$CM_BUILD_DIR/build/ios/ipa"
           PAYLOAD_DIR="$IPA_DIR/Payload"
-          APP_BUNDLE="$PAYLOAD_DIR/ARKitPoseStreamer.app"
+          APP_BUNDLE="$PAYLOAD_DIR/ARKitRobotAppapp"
           
           # 1. Find the binary file inside the archive
           # It might be in usr/local/bin because it's an executable
-          BINARY_SOURCE=$(find "$CM_BUILD_DIR/ARKitPoseStreamer.xcarchive" -name "ARKitPoseStreamer" -type f | head -n 1)
+          BINARY_SOURCE=$(find "$CM_BUILD_DIR/ARKitRobotApp.xcarchive" -name "ARKitRobotApp" -type f | head -n 1)
           
           if [ -z "$BINARY_SOURCE" ]; then
             echo "Error: Could not find the compiled binary!"
@@ -34,7 +34,7 @@ workflows:
           mkdir -p "$APP_BUNDLE"
           
           # 3. Move the binary into the .app folder
-          cp "$BINARY_SOURCE" "$APP_BUNDLE/ARKitPoseStreamer"
+          cp "$BINARY_SOURCE" "$APP_BUNDLE/ARKitRobotApp"
           
           # 4. Copy the Info.plist into the .app folder
           # We assume Info.plist is in the root directory
@@ -42,7 +42,7 @@ workflows:
           
           # 5. Zip it into an .ipa
           cd "$IPA_DIR"
-          zip -r "ARKitPoseStreamer.ipa" "Payload"
+          zip -r "ARKitRobotApp.ipa" "Payload"
             
     artifacts:
       - build/ios/ipa/*.ipa

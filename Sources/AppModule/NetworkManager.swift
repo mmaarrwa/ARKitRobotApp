@@ -45,18 +45,5 @@ final class NetworkManager {
         connection?.send(content: data, completion: .contentProcessed({ _ in }))
     }
     
-    // 🎧 NEW: Listen for commands from Laptop (Remote Start)
-    private func receiveIncomingData() {
-        connection?.receiveMessage { [weak self] (data, context, isComplete, error) in
-            if let data = data, let message = String(data: data, encoding: .utf8) {
-                print("Received command: \(message)")
-                DispatchQueue.main.async {
-                    self?.onCommandReceived?(message) // Trigger action in ARManager
-                }
-            }
-            if error == nil {
-                self?.receiveIncomingData() // Keep listening
-            }
-        }
-    }
+
 }
