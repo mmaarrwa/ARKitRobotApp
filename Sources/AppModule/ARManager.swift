@@ -20,16 +20,16 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     private let network = NetworkManager.shared
 
     // --- Configurable parameters ---
-    private let rayGridSize = 5            // cast rayGridSize x rayGridSize rays in a square
-    private let rayScreenRadius: CGFloat = 0.12 // fraction of view min(width,height) to scan (e.g. 0.12)
-    private let maxRayDistance: Float = 3.0 // meters
+    private let rayGridSize = 5
+    private let rayScreenRadius: CGFloat = 0.12
+    private let maxRayDistance: Float = 3.0
     private let minRayDistance: Float = 0.15
-    private let featurePointConeHalfWidth: Float = 0.25 // meters left/right tolerance in camera space
+    private let featurePointConeHalfWidth: Float = 0.25
     private let featurePointConeHalfHeight: Float = 0.25
     private let featurePointNearZ: Float = -0.2
     private let featurePointFarZ: Float = -2.5
-    private let featurePointDensityThreshold = 60       // points counted inside cone -> treat as obstacle
-    private let densityFallbackMinDistance: Float = 0.4 // if density triggers, treat obstacle at this conservative distance
+    private let featurePointDensityThreshold = 60
+    private let densityFallbackMinDistance: Float = 0.4
 
     override init() {
         super.init()
@@ -82,7 +82,7 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         let pos = SIMD3<Float>(col3.x, col3.y, col3.z)
         let q = simd_quatf(cameraTransform)
 
-        // 2. Obstacle detection (raycast primary, feature-point density fallback)
+        // 2. Obstacle detection
         let obstacleDistance = detectObstacleDistance(frame: frame)
 
         // 3. Build payload and send
@@ -98,58 +98,55 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
 
     // MARK: - Obstacle detection helpers
 
-    /// Returns the estimated obstacle distance in meters.
-    /// If no obstacle is detected within maxRayDistance, returns a large value (e.g. 10.0).
     private func detectObstacleDistance(frame: ARFrame) -> Float {
-        // 1) Try multi-raycast over a small cone around screen center.
-        if let rayDistance = performMultiRaycast() {
+        // 1) Try multi-raycast
+        if let rayDistance = performMultiRaycast(cameraTransform: frame.camera.transform) {
             return rayDistance
         }
 
-        // 2) Raycast missed — use feature-point density fallback
+        // 2) Fallback to feature points
         if let densityDistance = featurePointDensityFallback(frame: frame) {
             return densityDistance
         }
 
         // 3) Nothing detected
-        return 10.0 // no obstacle nearby
+        return 10.0
     }
 
-    /// Shoot multiple rays in a square grid around the screen center and return the nearest hit distance (meters).
-    /// Returns nil if no ray hit within maxRayDistance.
-    private func performMultiRaycast() -> Float? {
-        //guard let view = sceneView else { return nil }
+    private func performMultiRaycast(cameraTransform: simd_float4x4) -> Float? {
         let view = sceneView
-
-
-        // center + grid offsets in view space (pixels)
         let bounds = view.bounds
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
         let minSide = min(bounds.width, bounds.height)
         let radiusPx = rayScreenRadius * minSide
 
         var nearestDistance: Float? = nil
+        
+        // We need the camera position to calculate distance manually
+        let camPos = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
 
-        // sample grid from -half..+half
         let half = (rayGridSize - 1) / 2
         for i in 0..<rayGridSize {
             for j in 0..<rayGridSize {
-                // normalized offsets in [-1,1]
                 let nx = CGFloat(i - half) / CGFloat(max(1, half))
                 let ny = CGFloat(j - half) / CGFloat(max(1, half))
 
-                // map to pixel offset within radius
                 let samplePoint = CGPoint(x: center.x + nx * radiusPx,
                                           y: center.y + ny * radiusPx)
 
-                // create raycast query from that screen point
                 if let query = sceneView.raycastQuery(from: samplePoint,
                                                       allowing: .estimatedPlane,
                                                       alignment: .any) {
                     let results = sceneView.session.raycast(query)
                     if let hit = results.first {
-                        // ARRaycastResult.distance is meters from camera
-                        let d = Float(hit.distance)
+                        // FIX: Calculate distance manually because ARRaycastResult has no .distance property
+                        let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x, 
+                                                  hit.worldTransform.columns.3.y, 
+                                                  hit.worldTransform.columns.3.z)
+                        
+                        // Distance formula: √((x2-x1)^2 + ...)
+                        let d = distance(camPos, hitPos)
+                        
                         if d >= minRayDistance && d <= maxRayDistance {
                             if let current = nearestDistance {
                                 nearestDistance = min(current, d)
@@ -165,12 +162,9 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         return nearestDistance
     }
 
-    /// Fallback: counts feature points inside a forward cone in camera space.
-    /// If density exceeds threshold, return a conservative distance. Otherwise nil.
     private func featurePointDensityFallback(frame: ARFrame) -> Float? {
         guard let points = frame.rawFeaturePoints?.points else { return nil }
 
-        // convert world -> camera once
         let cameraTransform = frame.camera.transform
         let worldToCamera = cameraTransform.inverse
 
@@ -178,15 +172,12 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         var nearestZ: Float? = nil
 
         for p in points {
-            // world point as homogenous
             let worldPoint = simd_float4(p.x, p.y, p.z, 1)
-            let local = simd_mul(worldToCamera, worldPoint) // camera space
+            let local = simd_mul(worldToCamera, worldPoint)
 
-            // camera space: forward is negative z
             if local.z < featurePointNearZ && local.z > featurePointFarZ {
                 if abs(local.x) <= featurePointConeHalfWidth && abs(local.y) <= featurePointConeHalfHeight {
                     count += 1
-                    // track nearest forward absolute distance
                     if nearestZ == nil || abs(local.z) < nearestZ! {
                         nearestZ = abs(local.z)
                     }
@@ -195,12 +186,8 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         }
 
         if count >= featurePointDensityThreshold {
-            // if we have many points, consider there is an obstacle.
-            // Use nearestZ if available, or a conservative fallback distance.
             if let nz = nearestZ {
-                // clamp to reasonable bounds
-                let clamped = max(minRayDistance, min(maxRayDistance, nz))
-                return clamped
+                return max(minRayDistance, min(maxRayDistance, nz))
             } else {
                 return densityFallbackMinDistance
             }
