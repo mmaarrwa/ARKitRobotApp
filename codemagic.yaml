@@ -17,7 +17,7 @@ workflows:
           # Define paths
           IPA_DIR="$CM_BUILD_DIR/build/ios/ipa"
           PAYLOAD_DIR="$IPA_DIR/Payload"
-          APP_BUNDLE="$PAYLOAD_DIR/ARKitRobotAppapp"
+          APP_BUNDLE="$PAYLOAD_DIR/ARKitRobotApp.app"
           
           # 1. Find the binary file inside the archive
           # It might be in usr/local/bin because it's an executable
