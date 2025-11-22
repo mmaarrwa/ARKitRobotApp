@@ -118,7 +118,9 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     /// Shoot multiple rays in a square grid around the screen center and return the nearest hit distance (meters).
     /// Returns nil if no ray hit within maxRayDistance.
     private func performMultiRaycast() -> Float? {
-        guard let view = sceneView else { return nil }
+        //guard let view = sceneView else { return nil }
+        let view = sceneView
+
 
         // center + grid offsets in view space (pixels)
         let bounds = view.bounds
