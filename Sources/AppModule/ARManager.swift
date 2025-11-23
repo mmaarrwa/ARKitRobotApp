@@ -20,16 +20,26 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     private let network = NetworkManager.shared
 
     // --- Configurable parameters ---
-    private let rayGridSize = 5
-    private let rayScreenRadius: CGFloat = 0.12
+    private let rayGridSize = 5            // 5x5 Grid
+    private let rayScreenRadius: CGFloat = 0.15 // Slightly wider scan
     private let maxRayDistance: Float = 3.0
     private let minRayDistance: Float = 0.15
+    
+    // Feature Point Fallback Params
     private let featurePointConeHalfWidth: Float = 0.25
     private let featurePointConeHalfHeight: Float = 0.25
     private let featurePointNearZ: Float = -0.2
     private let featurePointFarZ: Float = -2.5
     private let featurePointDensityThreshold = 60
     private let densityFallbackMinDistance: Float = 0.4
+
+    // --- Smoothing & Confidence ---
+    private var smoothedObstacleDist: Float = 10.0 // Initialize with "far"
+    private let smoothingAlpha: Float = 0.2 // 0.2 = Slow/Smooth, 0.8 = Fast/Jittery
+
+    // --- Surveying Logic ---
+    private var lastSurveyPosition: SIMD3<Float> = SIMD3<Float>(0, 0, 0)
+    private let surveyInterval: Float = 2.0 // Meters required to trigger a survey packet
 
     override init() {
         super.init()
@@ -60,6 +70,9 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
 
         if isStreaming {
             statusText = "Streaming..."
+            smoothedObstacleDist = 10.0 // Reset smoothing on start
+            lastSurveyPosition = SIMD3<Float>(0,0,0) // Reset survey logic
+            
             network.start(ipAddress: serverIP)
 
             let config = ARWorldTrackingConfiguration()
@@ -76,54 +89,82 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard isStreaming else { return }
 
-        // 1. Pose
+        // 1. Get Current Pose
         let cameraTransform = frame.camera.transform
         let col3 = cameraTransform.columns.3
-        let pos = SIMD3<Float>(col3.x, col3.y, col3.z)
+        let currentPos = SIMD3<Float>(col3.x, col3.y, col3.z)
         let q = simd_quatf(cameraTransform)
 
-        // 2. Obstacle detection
+        // 2. Calculate Obstacle Distance (Hybrid: HitTest + Smoothing)
         let obstacleDistance = detectObstacleDistance(frame: frame)
 
-        // 3. Build payload and send
-        let pose: [String: Any] = [
+        // ---------------------------------------------------------
+        // PACKET 1: NAVIGATION (Sent Every Frame)
+        // ---------------------------------------------------------
+        let navPacket: [String: Any] = [
+            "type": "nav",
             "timestamp": frame.timestamp,
-            "position": [pos.x, pos.y, pos.z],
+            "position": [currentPos.x, currentPos.y, currentPos.z],
             "orientation": [q.vector.x, q.vector.y, q.vector.z, q.vector.w],
             "obstacle_dist": obstacleDistance
         ]
+        network.sendPose(navPacket)
 
-        network.sendPose(pose)
+        // ---------------------------------------------------------
+        // PACKET 2: SURVEYING (Sent Every 2 Meters)
+        // ---------------------------------------------------------
+        let distMoved = distance(currentPos, lastSurveyPosition)
+
+        if distMoved >= surveyInterval {
+            // Create survey data
+            let surveyPacket: [String: Any] = [
+                "type": "survey",
+                "timestamp": frame.timestamp,
+                "position": [currentPos.x, currentPos.y, currentPos.z],
+                "label": "Survey Point", // You can replace this later with ML detection
+                "note": "Captured at \(String(format: "%.2f", distMoved))m interval"
+            ]
+            
+            network.sendPose(surveyPacket)
+            
+            // Reset tracker
+            lastSurveyPosition = currentPos
+            print("📍 Survey Packet Sent at: \(currentPos)")
+        }
     }
 
     // MARK: - Obstacle detection helpers
 
     private func detectObstacleDistance(frame: ARFrame) -> Float {
-        // 1) Try multi-raycast
-        if let rayDistance = performMultiRaycast(cameraTransform: frame.camera.transform) {
-            return rayDistance
+        var rawDistance: Float = 10.0 // Default: No obstacle
+
+        // 1) Priority: Grid Hit Test (High Confidence)
+        if let hitDist = performGridHitTest(cameraTransform: frame.camera.transform) {
+            rawDistance = hitDist
+        } 
+        // 2) Fallback: Feature Point Density (Medium Confidence)
+        else if let densityDist = featurePointDensityFallback(frame: frame) {
+            rawDistance = densityDist
         }
 
-        // 2) Fallback to feature points
-        if let densityDistance = featurePointDensityFallback(frame: frame) {
-            return densityDistance
-        }
-
-        // 3) Nothing detected
-        return 10.0
+        // 3) Apply Exponential Weighted Moving Average (EWMA) Smoothing
+        smoothedObstacleDist = (smoothingAlpha * rawDistance) + ((1.0 - smoothingAlpha) * smoothedObstacleDist)
+        
+        return smoothedObstacleDist
     }
 
-    private func performMultiRaycast(cameraTransform: simd_float4x4) -> Float? {
+    private func performGridHitTest(cameraTransform: simd_float4x4) -> Float? {
         let view = sceneView
         let bounds = view.bounds
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
         let minSide = min(bounds.width, bounds.height)
         let radiusPx = rayScreenRadius * minSide
 
-        var nearestDistance: Float? = nil
-        
-        // We need the camera position to calculate distance manually
         let camPos = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
+        
+        var nearestDistance: Float? = nil
+        var hitCount = 0
+        let requiredHits = 2 
 
         let half = (rayGridSize - 1) / 2
         for i in 0..<rayGridSize {
@@ -134,32 +175,31 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
                 let samplePoint = CGPoint(x: center.x + nx * radiusPx,
                                           y: center.y + ny * radiusPx)
 
-                if let query = sceneView.raycastQuery(from: samplePoint,
-                                                      allowing: .estimatedPlane,
-                                                      alignment: .any) {
-                    let results = sceneView.session.raycast(query)
-                    if let hit = results.first {
-                        // FIX: Calculate distance manually because ARRaycastResult has no .distance property
-                        let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x, 
-                                                  hit.worldTransform.columns.3.y, 
-                                                  hit.worldTransform.columns.3.z)
-                        
-                        // Distance formula: √((x2-x1)^2 + ...)
-                        let d = distance(camPos, hitPos)
-                        
-                        if d >= minRayDistance && d <= maxRayDistance {
-                            if let current = nearestDistance {
-                                nearestDistance = min(current, d)
-                            } else {
-                                nearestDistance = d
-                            }
+                let results = view.hitTest(samplePoint, types: [.featurePoint, .existingPlaneUsingExtent, .estimatedHorizontalPlane])
+                
+                if let hit = results.first {
+                    let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x, 
+                                              hit.worldTransform.columns.3.y, 
+                                              hit.worldTransform.columns.3.z)
+                    
+                    let d = distance(camPos, hitPos)
+                    
+                    if d >= minRayDistance && d <= maxRayDistance {
+                        hitCount += 1
+                        if let current = nearestDistance {
+                            nearestDistance = min(current, d)
+                        } else {
+                            nearestDistance = d
                         }
                     }
                 }
             }
         }
 
-        return nearestDistance
+        if hitCount >= requiredHits {
+            return nearestDistance
+        }
+        return nil
     }
 
     private func featurePointDensityFallback(frame: ARFrame) -> Float? {
