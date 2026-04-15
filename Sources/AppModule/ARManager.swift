@@ -52,6 +52,16 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         guard ARWorldTrackingConfiguration.isSupported else { return }
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
+        
+        // --- NEW LiDAR CHECK ---
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+            config.sceneReconstruction = .mesh
+            print("🟢 LiDAR Active: App Opened with LiDAR.")
+        } else {
+            print("🟡 Standard VIO Active: App Opened without LiDAR.")
+        }
+        // -----------------------
+        
         sceneView.session.run(config)
         sceneView.session.delegate = self
         statusText = "Ready to Connect"
@@ -77,6 +87,16 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
 
             let config = ARWorldTrackingConfiguration()
             config.worldAlignment = .gravity
+            
+            // --- NEW LiDAR CHECK ---
+            if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+                config.sceneReconstruction = .mesh
+                print("🟢 LiDAR Active: Streaming Started with LiDAR.")
+            } else {
+                print("🟡 Standard VIO Active: Streaming Started without LiDAR.")
+            }
+            // -----------------------
+            
             sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
 
         } else {
