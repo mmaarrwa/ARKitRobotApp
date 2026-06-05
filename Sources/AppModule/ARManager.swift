@@ -19,28 +19,30 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
 
     private let network = NetworkManager.shared
 
-    // --- Configurable parameters ---
-    private let rayGridSize = 5            // 5x5 Grid
-    private let rayScreenRadius: CGFloat = 0.15 // Slightly wider scan
-    private let maxRayDistance: Float = 3.0
-    private let minRayDistance: Float = 0.15
-    
-    // Feature Point Fallback Params
-    private let featurePointConeHalfWidth: Float = 0.25
-    private let featurePointConeHalfHeight: Float = 0.25
-    private let featurePointNearZ: Float = -0.2
-    private let featurePointFarZ: Float = -2.5
-    private let featurePointDensityThreshold = 60
-    private let densityFallbackMinDistance: Float = 0.4
+    // MARK: - Grid Parameters (shared by raycast and hitTest)
+    private let rayGridSize          = 5              // 5×5 grid
+    private let rayScreenRadius:     CGFloat = 0.15   // grid radius as fraction of screen min-side
+    private let maxRayDistance:      Float   = 3.0
+    private let minRayDistance:      Float   = 0.15
+    private let requiredHits                 = 2      // min hits to trust result
 
-    // --- Smoothing & Confidence ---
-    private var smoothedObstacleDist: Float = 10.0 // Initialize with "far"
-    private let smoothingAlpha: Float = 0.2 // 0.2 = Slow/Smooth, 0.8 = Fast/Jittery
+    // MARK: - Feature Point Cone Parameters
+    private let fpConeHalfWidth:     Float   = 0.25
+    private let fpConeHalfHeight:    Float   = 0.25
+    private let fpNearZ:             Float   = 0.20   // ignore closer than 0.2 m
+    private let fpFarZ:              Float   = 2.50   // ignore farther than 2.5 m
+    private let fpDensityThreshold           = 60
+    private let fpFallbackMinDist:   Float   = 0.40
 
-    // --- Surveying Logic ---
-    private var lastSurveyPosition: SIMD3<Float> = SIMD3<Float>(0, 0, 0)
-    private let surveyInterval: Float = 2.0 // Meters required to trigger a survey packet
+    // MARK: - Smoothing
+    private var smoothedObstacleDist: Float  = 10.0
+    private let smoothingAlpha:       Float  = 0.2    // 0.2=smooth, 0.8=reactive
 
+    // MARK: - Surveying
+    private var lastSurveyPosition: SIMD3<Float> = .zero
+    private let surveyInterval:      Float   = 2.0    // metres between survey packets
+
+    // MARK: - Init
     override init() {
         super.init()
         network.onCommandReceived = { [weak self] command in
@@ -48,57 +50,41 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
+    // MARK: - Session Management
     func startSessionIfNeeded() {
         guard ARWorldTrackingConfiguration.isSupported else { return }
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
-        
-        // --- NEW LiDAR CHECK ---
         if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
             config.sceneReconstruction = .mesh
-            print("🟢 LiDAR Active: App Opened with LiDAR.")
+            print("🟢 LiDAR Active")
         } else {
-            print("🟡 Standard VIO Active: App Opened without LiDAR.")
+            print("🟡 Standard VIO")
         }
-        // -----------------------
-        
         sceneView.session.run(config)
         sceneView.session.delegate = self
         statusText = "Ready to Connect"
     }
 
     func handleRemoteCommand(_ command: String) {
-        if command == "START" {
-            if !isStreaming { toggleStreaming() }
-        } else if command == "STOP" {
-            if isStreaming { toggleStreaming() }
-        }
+        if command == "START", !isStreaming { toggleStreaming() }
+        else if command == "STOP", isStreaming  { toggleStreaming() }
     }
 
     func toggleStreaming() {
         isStreaming.toggle()
-
         if isStreaming {
-            statusText = "Streaming..."
-            smoothedObstacleDist = 10.0 // Reset smoothing on start
-            lastSurveyPosition = SIMD3<Float>(0,0,0) // Reset survey logic
-            
+            statusText            = "Streaming..."
+            smoothedObstacleDist  = 10.0
+            lastSurveyPosition    = .zero
             network.start(ipAddress: serverIP)
 
             let config = ARWorldTrackingConfiguration()
             config.worldAlignment = .gravity
-            
-            // --- NEW LiDAR CHECK ---
             if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
                 config.sceneReconstruction = .mesh
-                print("🟢 LiDAR Active: Streaming Started with LiDAR.")
-            } else {
-                print("🟡 Standard VIO Active: Streaming Started without LiDAR.")
             }
-            // -----------------------
-            
             sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
-
         } else {
             statusText = "Stopped"
             network.stop()
@@ -109,150 +95,215 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard isStreaming else { return }
 
-        // 1. Get Current Pose
         let cameraTransform = frame.camera.transform
-        let col3 = cameraTransform.columns.3
-        let currentPos = SIMD3<Float>(col3.x, col3.y, col3.z)
-        let q = simd_quatf(cameraTransform)
+        let col3            = cameraTransform.columns.3
+        let currentPos      = SIMD3<Float>(col3.x, col3.y, col3.z)
+        let q               = simd_quatf(cameraTransform)
 
-        // 2. Calculate Obstacle Distance (Hybrid: HitTest + Smoothing)
-        let obstacleDistance = detectObstacleDistance(frame: frame)
+        // Returns distance + which method fired
+        let (obstacleDist, obstacleMethod) = detectObstacleDistance(frame: frame)
 
-        // ---------------------------------------------------------
-        // PACKET 1: NAVIGATION (Sent Every Frame)
-        // ---------------------------------------------------------
+        // ── Nav Packet (every frame) ──────────────────────────────────
         let navPacket: [String: Any] = [
-            "type": "nav",
-            "timestamp": frame.timestamp,
-            "position": [currentPos.x, currentPos.y, currentPos.z],
-            "orientation": [q.vector.x, q.vector.y, q.vector.z, q.vector.w],
-            "obstacle_dist": obstacleDistance
+            "type":            "nav",
+            "timestamp":       frame.timestamp,
+            "position":        [currentPos.x, currentPos.y, currentPos.z],
+            "orientation":     [q.vector.x, q.vector.y, q.vector.z, q.vector.w],
+            "obstacle_dist":   obstacleDist,
+            "obstacle_method": obstacleMethod   // "RC", "HT", "FP", or "NONE"
         ]
         network.sendPose(navPacket)
 
-        // ---------------------------------------------------------
-        // PACKET 2: SURVEYING (Sent Every 2 Meters)
-        // ---------------------------------------------------------
+        // ── Survey Packet (every 2 metres) ────────────────────────────
         let distMoved = distance(currentPos, lastSurveyPosition)
-
         if distMoved >= surveyInterval {
-            // Create survey data
             let surveyPacket: [String: Any] = [
-                "type": "survey",
+                "type":      "survey",
                 "timestamp": frame.timestamp,
-                "position": [currentPos.x, currentPos.y, currentPos.z],
-                "label": "Survey Point", // You can replace this later with ML detection
-                "note": "Captured at \(String(format: "%.2f", distMoved))m interval"
+                "position":  [currentPos.x, currentPos.y, currentPos.z],
+                "label":     "Survey Point",
+                "note":      "Captured at \(String(format: "%.2f", distMoved))m interval"
             ]
-            
             network.sendPose(surveyPacket)
-            
-            // Reset tracker
             lastSurveyPosition = currentPos
-            print("📍 Survey Packet Sent at: \(currentPos)")
+            print("📍 Survey packet sent at: \(currentPos)")
         }
     }
 
-    // MARK: - Obstacle detection helpers
+    // MARK: - Obstacle Distance Cascade
+    // Returns (smoothed distance, method tag)
+    // Priority: RC (raycast) → HT (hitTest) → FP (feature points) → NONE
+    private func detectObstacleDistance(frame: ARFrame) -> (Float, String) {
+        var rawDistance: Float = 10.0
+        var method = "NONE"
 
-    private func detectObstacleDistance(frame: ARFrame) -> Float {
-        var rawDistance: Float = 10.0 // Default: No obstacle
-
-        // 1) Priority: Grid Hit Test (High Confidence)
-        if let hitDist = performGridHitTest(cameraTransform: frame.camera.transform) {
-            rawDistance = hitDist
-        } 
-        // 2) Fallback: Feature Point Density (Medium Confidence)
-        else if let densityDist = featurePointDensityFallback(frame: frame) {
-            rawDistance = densityDist
+        if let (d, _) = performRaycastGrid(frame: frame) {
+            rawDistance = d
+            method      = "RC"
+        } else if let d = performHitTestGrid(cameraTransform: frame.camera.transform) {
+            rawDistance = d
+            method      = "HT"
+        } else if let d = featurePointFallback(frame: frame) {
+            rawDistance = d
+            method      = "FP"
         }
 
-        // 3) Apply Exponential Weighted Moving Average (EWMA) Smoothing
-        smoothedObstacleDist = (smoothingAlpha * rawDistance) + ((1.0 - smoothingAlpha) * smoothedObstacleDist)
-        
-        return smoothedObstacleDist
+        smoothedObstacleDist = (smoothingAlpha * rawDistance) +
+                               ((1.0 - smoothingAlpha) * smoothedObstacleDist)
+        return (smoothedObstacleDist, method)
     }
 
-    private func performGridHitTest(cameraTransform: simd_float4x4) -> Float? {
-        let view = sceneView
-        let bounds = view.bounds
-        let center = CGPoint(x: bounds.midX, y: bounds.midY)
-        let minSide = min(bounds.width, bounds.height)
-        let radiusPx = rayScreenRadius * minSide
+    // MARK: - RC: ARKit session.raycast() 5×5 Grid
+    // Uses the reconstructed mesh/planes — more accurate than hitTest but
+    // needs a few seconds for ARKit to map the environment first.
+    // Must dispatch to main thread to call raycastQuery on ARSCNView.
+    // Returns (nearest distance, nearest world position) or nil.
+    private func performRaycastGrid(frame: ARFrame) -> (Float, SIMD3<Float>)? {
+        var result: (Float, SIMD3<Float>)? = nil
+        let semaphore = DispatchSemaphore(value: 0)
 
-        let camPos = SIMD3<Float>(cameraTransform.columns.3.x, cameraTransform.columns.3.y, cameraTransform.columns.3.z)
-        
-        var nearestDistance: Float? = nil
-        var hitCount = 0
-        let requiredHits = 2 
+        DispatchQueue.main.async { [weak self] in
+            defer { semaphore.signal() }
+            guard let self = self else { return }
 
-        let half = (rayGridSize - 1) / 2
-        for i in 0..<rayGridSize {
-            for j in 0..<rayGridSize {
-                let nx = CGFloat(i - half) / CGFloat(max(1, half))
-                let ny = CGFloat(j - half) / CGFloat(max(1, half))
+            let view     = self.sceneView
+            let bounds   = view.bounds
+            let centerX  = bounds.midX
+            let centerY  = bounds.midY
+            let radius   = self.rayScreenRadius * min(bounds.width, bounds.height)
 
-                let samplePoint = CGPoint(x: center.x + nx * radiusPx,
-                                          y: center.y + ny * radiusPx)
+            let camPos   = SIMD3<Float>(
+                frame.camera.transform.columns.3.x,
+                frame.camera.transform.columns.3.y,
+                frame.camera.transform.columns.3.z
+            )
 
-                let results = view.hitTest(samplePoint, types: [.featurePoint, .existingPlaneUsingExtent, .estimatedHorizontalPlane])
-                
-                if let hit = results.first {
-                    let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x, 
-                                              hit.worldTransform.columns.3.y, 
-                                              hit.worldTransform.columns.3.z)
-                    
-                    let d = distance(camPos, hitPos)
-                    
-                    if d >= minRayDistance && d <= maxRayDistance {
-                        hitCount += 1
-                        if let current = nearestDistance {
-                            nearestDistance = min(current, d)
-                        } else {
-                            nearestDistance = d
+            var bestDist:  Float            = .greatestFiniteMagnitude
+            var bestPos:   SIMD3<Float>?    = nil
+            var hitCount                    = 0
+
+            let half = (self.rayGridSize - 1) / 2
+            for i in 0..<self.rayGridSize {
+                for j in 0..<self.rayGridSize {
+                    let ox = CGFloat(i - half) / CGFloat(max(1, half))
+                    let oy = CGFloat(j - half) / CGFloat(max(1, half))
+                    let pt = CGPoint(x: centerX + ox * radius,
+                                     y: centerY + oy * radius)
+
+                    // Try existing geometry first, fall back to estimated plane
+                    let targets: [ARRaycastQuery.Target] = [
+                        .existingPlaneGeometry,
+                        .estimatedPlane
+                    ]
+                    for target in targets {
+                        guard let query = view.raycastQuery(
+                            from: pt,
+                            allowing: target,
+                            alignment: .any
+                        ) else { continue }
+
+                        let hits = view.session.raycast(query)
+                        if let hit = hits.first {
+                            let hp = SIMD3<Float>(
+                                hit.worldTransform.columns.3.x,
+                                hit.worldTransform.columns.3.y,
+                                hit.worldTransform.columns.3.z
+                            )
+                            let d = distance(camPos, hp)
+                            if d >= self.minRayDistance && d <= self.maxRayDistance {
+                                hitCount += 1
+                                if d < bestDist {
+                                    bestDist = d
+                                    bestPos  = hp
+                                }
+                            }
+                            break  // got a hit for this grid point, move on
                         }
                     }
                 }
             }
+
+            if hitCount >= self.requiredHits, let pos = bestPos {
+                result = (bestDist, pos)
+            }
         }
 
-        if hitCount >= requiredHits {
-            return nearestDistance
-        }
-        return nil
+        semaphore.wait()
+        return result
     }
 
-    private func featurePointDensityFallback(frame: ARFrame) -> Float? {
-        guard let points = frame.rawFeaturePoints?.points else { return nil }
+    // MARK: - HT: Legacy hitTest() 5×5 Grid  (unchanged from original)
+    // Works on feature points + estimated planes — faster on fresh scenes
+    // before raycast has enough map data.
+    private func performHitTestGrid(cameraTransform: simd_float4x4) -> Float? {
+        let view     = sceneView
+        let bounds   = view.bounds
+        let centerX  = bounds.midX
+        let centerY  = bounds.midY
+        let radius   = rayScreenRadius * min(bounds.width, bounds.height)
+        let camPos   = SIMD3<Float>(
+            cameraTransform.columns.3.x,
+            cameraTransform.columns.3.y,
+            cameraTransform.columns.3.z
+        )
 
-        let cameraTransform = frame.camera.transform
-        let worldToCamera = cameraTransform.inverse
+        var nearestDist: Float? = nil
+        var hitCount            = 0
 
-        var count = 0
-        var nearestZ: Float? = nil
+        let half = (rayGridSize - 1) / 2
+        for i in 0..<rayGridSize {
+            for j in 0..<rayGridSize {
+                let ox = CGFloat(i - half) / CGFloat(max(1, half))
+                let oy = CGFloat(j - half) / CGFloat(max(1, half))
+                let pt = CGPoint(x: centerX + ox * radius,
+                                  y: centerY + oy * radius)
 
-        for p in points {
-            let worldPoint = simd_float4(p.x, p.y, p.z, 1)
-            let local = simd_mul(worldToCamera, worldPoint)
-
-            if local.z < featurePointNearZ && local.z > featurePointFarZ {
-                if abs(local.x) <= featurePointConeHalfWidth && abs(local.y) <= featurePointConeHalfHeight {
-                    count += 1
-                    if nearestZ == nil || abs(local.z) < nearestZ! {
-                        nearestZ = abs(local.z)
+                let hits = view.hitTest(pt, types: [
+                    .featurePoint,
+                    .existingPlaneUsingExtent,
+                    .estimatedHorizontalPlane
+                ])
+                if let hit = hits.first {
+                    let hp = SIMD3<Float>(
+                        hit.worldTransform.columns.3.x,
+                        hit.worldTransform.columns.3.y,
+                        hit.worldTransform.columns.3.z
+                    )
+                    let d = distance(camPos, hp)
+                    if d >= minRayDistance && d <= maxRayDistance {
+                        hitCount += 1
+                        nearestDist = nearestDist.map { min($0, d) } ?? d
                     }
                 }
             }
         }
 
-        if count >= featurePointDensityThreshold {
-            if let nz = nearestZ {
-                return max(minRayDistance, min(maxRayDistance, nz))
-            } else {
-                return densityFallbackMinDistance
-            }
-        } else {
-            return nil
+        return hitCount >= requiredHits ? nearestDist : nil
+    }
+
+    // MARK: - FP: Feature Point Density Cone  (unchanged from original)
+    private func featurePointFallback(frame: ARFrame) -> Float? {
+        guard let points = frame.rawFeaturePoints?.points else { return nil }
+
+        let worldToCam = frame.camera.transform.inverse
+        var count      = 0
+        var nearestZ:  Float? = nil
+
+        for p in points {
+            let wp    = simd_float4(p.x, p.y, p.z, 1)
+            let local = simd_mul(worldToCam, wp)
+            let absZ  = -local.z   // positive = in front of camera
+
+            guard absZ > fpNearZ && absZ < fpFarZ else { continue }
+            guard abs(local.x) <= fpConeHalfWidth,
+                  abs(local.y) <= fpConeHalfHeight else { continue }
+
+            count += 1
+            nearestZ = nearestZ.map { min($0, absZ) } ?? absZ
         }
+
+        guard count >= fpDensityThreshold else { return nil }
+        return nearestZ.map { max(minRayDistance, min(maxRayDistance, $0)) }
+               ?? fpFallbackMinDist
     }
 }
