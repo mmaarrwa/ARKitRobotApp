@@ -9,15 +9,11 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     let sceneView: ARSCNView = {
         let v = ARSCNView(frame: .zero)
         v.autoenablesDefaultLighting = true
-        // Visualizing rays and feature points for debugging
         v.debugOptions = [.showFeaturePoints, .showWorldOrigin]
         return v
     }()
 
     @Published var isStreaming: Bool = false
-    @Published var statusText: String = "Idle"
-    @Published var serverIP: String = "192.168.1.10"
-
     private let network = NetworkManager.shared
     
     // --- Scanning Parameters ---
@@ -36,28 +32,6 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
-    func startSessionIfNeeded() {
-        guard ARWorldTrackingConfiguration.isSupported else { return }
-        let config = ARWorldTrackingConfiguration()
-        config.worldAlignment = .gravity
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-            config.sceneReconstruction = .mesh
-        }
-        sceneView.session.run(config)
-        sceneView.session.delegate = self
-    }
-
-    func toggleStreaming() {
-        isStreaming.toggle()
-        if isStreaming { network.start(ipAddress: serverIP) } else { network.stop() }
-    }
-
-    func handleRemoteCommand(_ command: String) {
-        if command == "START" { if !isStreaming { toggleStreaming() } }
-        else if command == "STOP" { if isStreaming { toggleStreaming() } }
-    }
-
-    // MARK: - ARSessionDelegate
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard isStreaming else { return }
 
@@ -65,9 +39,9 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         let pos = cameraTransform.columns.3
         let q = simd_quatf(cameraTransform)
 
+        // Cascade logic
         let scanResults = getFullLaserScan(frame: frame)
         
-        // Smoothing the array
         for i in 0..<numScanColumns {
             smoothedScan[i] = (smoothingAlpha * scanResults.distances[i]) + ((1.0 - smoothingAlpha) * smoothedScan[i])
         }
@@ -89,17 +63,20 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh),
            let data = m1_lidar(frame: frame) { return (data, 1.0, "M1_LiDAR") }
         
-        // [M2] Raycast
-        if let data = m2_raycast(frame: frame) { return (data, 0.8, "M2_Raycast") }
+        // [M2] Raycast - CRITICAL: Must be called from Main Thread to avoid crash
+        var rayData: [Float]?
+        DispatchQueue.main.sync { rayData = m2_raycast(frame: frame) }
+        if let data = rayData { return (data, 0.8, "M2_Raycast") }
         
-        // [M3] HitTest
-        if let data = m3_hitTest(frame: frame) { return (data, 0.5, "M3_HitTest") }
+        // [M3] HitTest - CRITICAL: Must be called from Main Thread
+        var hitData: [Float]?
+        DispatchQueue.main.sync { hitData = m3_hitTest(frame: frame) }
+        if let data = hitData { return (data, 0.5, "M3_HitTest") }
         
-        // [M4] Fallback
         return (m4_cone(), 0.2, "M4_Cone")
     }
 
-    // MARK: - Method Implementations
+    // --- Method Implementations ---
     private func m1_lidar(frame: ARFrame) -> [Float]? {
         guard let depthMap = frame.smoothedSceneDepth?.depthMap else { return nil }
         CVPixelBufferLockBaseAddress(depthMap, .readOnly); defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
@@ -144,10 +121,6 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         return res.contains(where: { $0 != .infinity }) ? res : nil
     }
 
-    private func m4_cone() -> [Float] {
-        return Array(repeating: 3.0, count: numScanColumns) // Simplified fallback
-    }
+    private func m4_cone() -> [Float] { return Array(repeating: 3.0, count: numScanColumns) }
 }
-
-// Extension to help with Matrix math
 extension simd_float4 { var xyz: simd_float3 { return simd_float3(x, y, z) } }
