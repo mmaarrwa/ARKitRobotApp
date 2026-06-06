@@ -96,7 +96,7 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         if let data = m3_hitTest(frame: frame) { return (data, 0.5, "M3_HitTest") }
         
         // [M4] Fallback
-        return (m4_cone(frame: frame), 0.2, "M4_Cone")
+        return (m4_cone(), 0.2, "M4_Cone")
     }
 
     // MARK: - Method Implementations
