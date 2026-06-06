@@ -228,124 +228,116 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         return nil
     }
 
+    // FIX: Removed Semaphore/Async thread blockers. Runs straight on Main thread.
     private func m2_raycastGrid(frame: ARFrame) -> Float? {
+        let view = self.sceneView
+        let bounds = view.bounds
+        
+        // Safety check if view hasn't sized yet
+        if bounds.width == 0 { return nil }
+
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let minSide = min(bounds.width, bounds.height)
+        let radiusPx = self.rayScreenRadius * minSide
+
+        let camPos = SIMD3<Float>(frame.camera.transform.columns.3.x, 
+                                  frame.camera.transform.columns.3.y, 
+                                  frame.camera.transform.columns.3.z)
+        
         var nearestDistance: Float? = nil
-        let semaphore = DispatchSemaphore(value: 0)
+        var hitCount = 0
+        let requiredHits = 2 
+        let half = (self.rayGridSize - 1) / 2
+        
+        for i in 0..<self.rayGridSize {
+            for j in 0..<self.rayGridSize {
+                let nx = CGFloat(i - half) / CGFloat(max(1, half))
+                let ny = CGFloat(j - half) / CGFloat(max(1, half))
 
-        DispatchQueue.main.async {
-            defer { semaphore.signal() }
-            
-            let view = self.sceneView
-            let bounds = view.bounds
-            let center = CGPoint(x: bounds.midX, y: bounds.midY)
-            let minSide = min(bounds.width, bounds.height)
-            let radiusPx = self.rayScreenRadius * minSide
+                let samplePoint = CGPoint(x: center.x + nx * radiusPx,
+                                          y: center.y + ny * radiusPx)
 
-            let camPos = SIMD3<Float>(frame.camera.transform.columns.3.x, 
-                                      frame.camera.transform.columns.3.y, 
-                                      frame.camera.transform.columns.3.z)
-            
-            var hitCount = 0
-            let requiredHits = 2 
-            let half = (self.rayGridSize - 1) / 2
-            
-            for i in 0..<self.rayGridSize {
-                for j in 0..<self.rayGridSize {
-                    let nx = CGFloat(i - half) / CGFloat(max(1, half))
-                    let ny = CGFloat(j - half) / CGFloat(max(1, half))
-
-                    let samplePoint = CGPoint(x: center.x + nx * radiusPx,
-                                              y: center.y + ny * radiusPx)
-
-                    guard let query = view.raycastQuery(from: samplePoint, allowing: .estimatedPlane, alignment: .any) else { continue }
-                    let results = view.session.raycast(query)
+                guard let query = view.raycastQuery(from: samplePoint, allowing: .estimatedPlane, alignment: .any) else { continue }
+                let results = view.session.raycast(query)
+                
+                if let hit = results.first {
+                    let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x, 
+                                              hit.worldTransform.columns.3.y, 
+                                              hit.worldTransform.columns.3.z)
                     
-                    if let hit = results.first {
-                        let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x, 
-                                                  hit.worldTransform.columns.3.y, 
-                                                  hit.worldTransform.columns.3.z)
-                        
-                        let d = distance(camPos, hitPos)
-                        
-                        if d >= self.minRayDistance && d <= self.maxRayDistance {
-                            hitCount += 1
-                            if let current = nearestDistance {
-                                nearestDistance = min(current, d)
-                            } else {
-                                nearestDistance = d
-                            }
+                    let d = distance(camPos, hitPos)
+                    
+                    if d >= self.minRayDistance && d <= self.maxRayDistance {
+                        hitCount += 1
+                        if let current = nearestDistance {
+                            nearestDistance = min(current, d)
+                        } else {
+                            nearestDistance = d
                         }
                     }
                 }
             }
-
-            if hitCount < requiredHits {
-                nearestDistance = nil
-            }
         }
-        
-        semaphore.wait()
-        return nearestDistance
+
+        if hitCount >= requiredHits {
+            return nearestDistance
+        }
+        return nil
     }
 
+    // FIX: Removed Semaphore/Async thread blockers. Runs straight on Main thread.
     private func m3_hitTestGrid(frame: ARFrame) -> Float? {
+        let view = self.sceneView
+        let bounds = view.bounds
+        
+        if bounds.width == 0 { return nil }
+        
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let minSide = min(bounds.width, bounds.height)
+        let radiusPx = self.rayScreenRadius * minSide
+
+        let camPos = SIMD3<Float>(frame.camera.transform.columns.3.x, 
+                                  frame.camera.transform.columns.3.y, 
+                                  frame.camera.transform.columns.3.z)
+        
         var nearestDistance: Float? = nil
-        let semaphore = DispatchSemaphore(value: 0)
+        var hitCount = 0
+        let requiredHits = 2 
+        let half = (self.rayGridSize - 1) / 2
+        
+        for i in 0..<self.rayGridSize {
+            for j in 0..<self.rayGridSize {
+                let nx = CGFloat(i - half) / CGFloat(max(1, half))
+                let ny = CGFloat(j - half) / CGFloat(max(1, half))
 
-        DispatchQueue.main.async {
-            defer { semaphore.signal() }
-            
-            let view = self.sceneView
-            let bounds = view.bounds
-            let center = CGPoint(x: bounds.midX, y: bounds.midY)
-            let minSide = min(bounds.width, bounds.height)
-            let radiusPx = self.rayScreenRadius * minSide
+                let samplePoint = CGPoint(x: center.x + nx * radiusPx,
+                                          y: center.y + ny * radiusPx)
 
-            let camPos = SIMD3<Float>(frame.camera.transform.columns.3.x, 
-                                      frame.camera.transform.columns.3.y, 
-                                      frame.camera.transform.columns.3.z)
-            
-            var hitCount = 0
-            let requiredHits = 2 
-            let half = (self.rayGridSize - 1) / 2
-            
-            for i in 0..<self.rayGridSize {
-                for j in 0..<self.rayGridSize {
-                    let nx = CGFloat(i - half) / CGFloat(max(1, half))
-                    let ny = CGFloat(j - half) / CGFloat(max(1, half))
-
-                    let samplePoint = CGPoint(x: center.x + nx * radiusPx,
-                                              y: center.y + ny * radiusPx)
-
-                    // Using the old hitTest logic as requested
-                    let results = view.hitTest(samplePoint, types: [.featurePoint, .existingPlaneUsingExtent, .estimatedHorizontalPlane])
+                let results = view.hitTest(samplePoint, types: [.featurePoint, .existingPlaneUsingExtent, .estimatedHorizontalPlane])
+                
+                if let hit = results.first {
+                    let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x, 
+                                              hit.worldTransform.columns.3.y, 
+                                              hit.worldTransform.columns.3.z)
                     
-                    if let hit = results.first {
-                        let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x, 
-                                                  hit.worldTransform.columns.3.y, 
-                                                  hit.worldTransform.columns.3.z)
-                        
-                        let d = distance(camPos, hitPos)
-                        
-                        if d >= self.minRayDistance && d <= self.maxRayDistance {
-                            hitCount += 1
-                            if let current = nearestDistance {
-                                nearestDistance = min(current, d)
-                            } else {
-                                nearestDistance = d
-                            }
+                    let d = distance(camPos, hitPos)
+                    
+                    if d >= self.minRayDistance && d <= self.maxRayDistance {
+                        hitCount += 1
+                        if let current = nearestDistance {
+                            nearestDistance = min(current, d)
+                        } else {
+                            nearestDistance = d
                         }
                     }
                 }
             }
-
-            if hitCount < requiredHits {
-                nearestDistance = nil
-            }
         }
-        
-        semaphore.wait()
-        return nearestDistance
+
+        if hitCount >= requiredHits {
+            return nearestDistance
+        }
+        return nil
     }
 
     private func m4_coneFallback(frame: ARFrame) -> Float? {
