@@ -9,26 +9,37 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     let sceneView: ARSCNView = {
         let v = ARSCNView(frame: .zero)
         v.autoenablesDefaultLighting = true
-        v.debugOptions = [.showFeaturePoints, .showWorldOrigin]
+        v.debugOptions = [.showFeaturePoints, .showWorldOrigin] // Kept the visuals!
         return v
     }()
 
     @Published var isStreaming: Bool = false
-    @Published var statusText: String = "Idle"        // ← needed by ContentView
-    @Published var serverIP: String = "192.168.1.10"  // ← needed by ContentView
+    @Published var statusText: String = "Idle"
+    @Published var serverIP: String = "192.168.1.10"
 
     private let network = NetworkManager.shared
 
-    // MARK: - Scan Parameters
-    private let numScanColumns = 30
-    private let rayScreenRadius: CGFloat = 0.30
+    // --- Configurable parameters ---
+    private let numScanColumns = 30           // The 1x30 LaserScan for ROS
+    private let rayScreenRadius: CGFloat = 0.30 // Spans 30% of the screen center
+    private let numRows = 5                   // 5 vertical rows to flatten
+    private let verticalSpread: CGFloat = 0.10  // 10% vertical spread
+    
     private let maxRayDistance: Float = 3.0
     private let minRayDistance: Float = 0.15
+    
+    // Feature Point Fallback Params
+    private let featurePointConeHalfWidth: Float = 0.25
+    private let featurePointConeHalfHeight: Float = 0.25
+    private let featurePointNearZ: Float = -0.2
+    private let featurePointFarZ: Float = -2.5
+    private let featurePointDensityThreshold = 60
+    private let densityFallbackMinDistance: Float = 0.4
+
+    // --- Smoothing ---
     private let smoothingAlpha: Float = 0.2
+    private var smoothedScan: [Float] = Array(repeating: 10.0, count: 30)
 
-    private var smoothedScan: [Float] = Array(repeating: 3.0, count: 30)
-
-    // MARK: - Init
     override init() {
         super.init()
         network.onCommandReceived = { [weak self] command in
@@ -36,17 +47,18 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
-    // MARK: - Session (needed by ContentView)
     func startSessionIfNeeded() {
         guard ARWorldTrackingConfiguration.isSupported else { return }
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
+        
         if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
             config.sceneReconstruction = .mesh
             print("🟢 LiDAR Active: App Opened with LiDAR.")
         } else {
             print("🟡 Standard VIO Active: App Opened without LiDAR.")
         }
+        
         sceneView.session.run(config)
         sceneView.session.delegate = self
         statusText = "Ready to Connect"
@@ -60,23 +72,19 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
-    // MARK: - toggleStreaming (needed by ContentView Start/Stop button)
     func toggleStreaming() {
         isStreaming.toggle()
 
         if isStreaming {
             statusText = "Streaming..."
-            smoothedScan = Array(repeating: 3.0, count: numScanColumns)
-
+            smoothedScan = Array(repeating: 10.0, count: numScanColumns) // Reset
+            
             network.start(ipAddress: serverIP)
 
             let config = ARWorldTrackingConfiguration()
             config.worldAlignment = .gravity
             if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
                 config.sceneReconstruction = .mesh
-                print("🟢 LiDAR Active: Streaming Started with LiDAR.")
-            } else {
-                print("🟡 Standard VIO Active: Streaming Started without LiDAR.")
             }
             sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
         } else {
@@ -89,151 +97,193 @@ final class ARManager: NSObject, ObservableObject, ARSessionDelegate {
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard isStreaming else { return }
 
+        // 1. Get Current Pose & Orientation
         let cameraTransform = frame.camera.transform
-        let pos = cameraTransform.columns.3
+        let col3 = cameraTransform.columns.3
+        let currentPos = SIMD3<Float>(col3.x, col3.y, col3.z)
         let q = simd_quatf(cameraTransform)
 
-        let scanResults = getFullLaserScan(frame: frame)
+        // 2. Cascade Logic (Get the 30-array, confidence, and method)
+        let (scanArray, confidence, method) = getLaserScan(frame: frame)
 
+        // 3. Smooth the Array
         for i in 0..<numScanColumns {
-            smoothedScan[i] = (smoothingAlpha * scanResults.distances[i]) +
-                              ((1.0 - smoothingAlpha) * smoothedScan[i])
+            smoothedScan[i] = (smoothingAlpha * scanArray[i]) + ((1.0 - smoothingAlpha) * smoothedScan[i])
         }
 
+        // 4. Send the Navigation Packet
         let navPacket: [String: Any] = [
-            "type":        "nav",
-            "timestamp":   frame.timestamp,
-            "position":    [pos.x, pos.y, pos.z],
+            "type": "nav",
+            "timestamp": frame.timestamp,
+            "position": [currentPos.x, currentPos.y, currentPos.z],
             "orientation": [q.vector.x, q.vector.y, q.vector.z, q.vector.w],
-            "laser_scan":  smoothedScan,
-            "confidence":  scanResults.confidence,
-            "method":      scanResults.method
+            "laser_scan": smoothedScan,
+            "confidence": confidence,
+            "method": method
         ]
         network.sendPose(navPacket)
     }
 
-    // MARK: - Laser Scan Cascade
-    // M1 → M2 → M3 → M4
-    private func getFullLaserScan(frame: ARFrame)
-        -> (distances: [Float], confidence: Float, method: String) {
+    // MARK: - Obstacle Cascade Logic
 
-        // M1: LiDAR — no main thread needed, reads pixel buffer directly
-        if let data = m1_lidar(frame: frame) {
-            return (data, 1.0, "M1_LiDAR")
-        }
-
-        // M2: Raycast — MUST run on main thread
-        var rayData: [Float]? = nil
-        let sem2 = DispatchSemaphore(value: 0)
-        DispatchQueue.main.async { [weak self] in
-            rayData = self?.m2_raycast(frame: frame)
-            sem2.signal()
-        }
-        sem2.wait()
-        if let data = rayData { return (data, 0.8, "M2_Raycast") }
-
-        // M3: HitTest — MUST run on main thread
-        var hitData: [Float]? = nil
-        let sem3 = DispatchSemaphore(value: 0)
-        DispatchQueue.main.async { [weak self] in
-            hitData = self?.m3_hitTest(frame: frame)
-            sem3.signal()
-        }
-        sem3.wait()
-        if let data = hitData { return (data, 0.5, "M3_HitTest") }
-
-        // M4: Cone fallback — always returns something
-        return (m4_cone(), 0.2, "M4_Cone")
+    private func getLaserScan(frame: ARFrame) -> (distances: [Float], confidence: Float, method: String) {
+        if let data = m1_lidarGrid(frame: frame) { return (data, 1.0, "M1_LiDAR") }
+        if let data = m2_raycastGrid(frame: frame) { return (data, 0.8, "M2_Raycast") }
+        if let data = m3_hitTestGrid(frame: frame) { return (data, 0.5, "M3_HitTest") }
+        
+        return (m4_coneFallback(frame: frame), 0.2, "M4_Cone")
     }
 
-    // MARK: - M1: LiDAR depth map (30 columns × 5 rows)
-    private func m1_lidar(frame: ARFrame) -> [Float]? {
-        guard let depthMap = frame.smoothedSceneDepth?.depthMap else { return nil }
+    // MARK: - Individual Methods (Flattening 5 rows into 30 cols)
+
+    private func m1_lidarGrid(frame: ARFrame) -> [Float]? {
+        guard let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth else { return nil }
+        let depthMap = depthData.depthMap
+        
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
-
-        let w   = CVPixelBufferGetWidth(depthMap)
-        let h   = CVPixelBufferGetHeight(depthMap)
-        let buf = CVPixelBufferGetBaseAddress(depthMap)!
-                    .assumingMemoryBound(to: Float32.self)
-
-        var res = Array(repeating: Float.infinity, count: numScanColumns)
+        
+        let w = CVPixelBufferGetWidth(depthMap)
+        let h = CVPixelBufferGetHeight(depthMap)
+        guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
+        let buf = baseAddress.assumingMemoryBound(to: Float32.self)
+        
+        var scan = Array(repeating: Float.infinity, count: numScanColumns)
+        var hitCount = 0
+        
         for col in 0..<numScanColumns {
-            let px = Int((Float(col) / Float(numScanColumns)) * Float(w))
-            for row in 0..<5 {
-                let py = Int((Float(row) / 5.0) * Float(h))
-                let d  = buf[py * w + px]
-                if d >= minRayDistance && d <= maxRayDistance {
-                    res[col] = min(res[col], d)
+            let nx = Float(col) / Float(numScanColumns - 1) * 2.0 - 1.0 // -1 to +1
+            let normX = 0.5 + (nx * Float(rayScreenRadius))
+            let px = max(0, min(Int(normX * Float(w)), w - 1))
+            
+            var colMin = Float.infinity
+            for row in 0..<numRows {
+                let ny = Float(row) / Float(max(1, numRows - 1)) * 2.0 - 1.0
+                let normY = 0.5 + (ny * Float(verticalSpread))
+                let py = max(0, min(Int(normY * Float(h)), h - 1))
+                
+                let dist = buf[py * w + px]
+                if dist >= minRayDistance && dist <= maxRayDistance {
+                    colMin = min(colMin, dist)
+                    hitCount += 1
                 }
             }
+            scan[col] = colMin
         }
-        // Only return if at least one column got a valid reading
-        return res.contains(where: { $0 != .infinity }) ? res : nil
+        
+        if hitCount > 0 { return scan }
+        return nil
     }
 
-    // MARK: - M2: ARKit session.raycast() — 30 columns
-    // Call only from main thread
-    private func m2_raycast(frame: ARFrame) -> [Float]? {
-        let view = sceneView
-        let w    = view.bounds.width
-        let midY = view.bounds.midY
-        let camPos = simd_float3(frame.camera.transform.columns.3.xyz)
+    private func m2_raycastGrid(frame: ARFrame) -> [Float]? {
+        let view = self.sceneView
+        let bounds = view.bounds
+        if bounds.width == 0 { return nil }
 
-        var res = Array(repeating: Float.infinity, count: numScanColumns)
-
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let camPos = SIMD3<Float>(frame.camera.transform.columns.3.x, 
+                                  frame.camera.transform.columns.3.y, 
+                                  frame.camera.transform.columns.3.z)
+        
+        var scan = Array(repeating: Float.infinity, count: numScanColumns)
+        var hitCount = 0
+        
         for col in 0..<numScanColumns {
-            let pt = CGPoint(x: CGFloat(col) / CGFloat(numScanColumns) * w,
-                             y: midY)
-            // Try existing geometry first, then estimated plane
-            for target: ARRaycastQuery.Target in [.existingPlaneGeometry, .estimatedPlane] {
-                guard let query = view.raycastQuery(from: pt,
-                                                    allowing: target,
-                                                    alignment: .any) else { continue }
-                if let hit = view.session.raycast(query).first {
-                    let hp = simd_float3(hit.worldTransform.columns.3.xyz)
-                    let d  = distance(camPos, hp)
+            let nx = CGFloat(col) / CGFloat(numScanColumns - 1) * 2.0 - 1.0
+            var colMin = Float.infinity
+            
+            for row in 0..<numRows {
+                let ny = CGFloat(row) / CGFloat(max(1, numRows - 1)) * 2.0 - 1.0
+                let samplePoint = CGPoint(x: center.x + nx * (rayScreenRadius * bounds.width),
+                                          y: center.y + ny * (verticalSpread * bounds.height))
+
+                guard let query = view.raycastQuery(from: samplePoint, allowing: .estimatedPlane, alignment: .any) else { continue }
+                let results = view.session.raycast(query)
+                
+                if let hit = results.first {
+                    let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x, hit.worldTransform.columns.3.y, hit.worldTransform.columns.3.z)
+                    let d = distance(camPos, hitPos)
                     if d >= minRayDistance && d <= maxRayDistance {
-                        res[col] = d
+                        colMin = min(colMin, d)
+                        hitCount += 1
                     }
-                    break
                 }
             }
+            scan[col] = colMin
         }
-        return res.contains(where: { $0 != .infinity }) ? res : nil
+        if hitCount > 0 { return scan }
+        return nil
     }
 
-    // MARK: - M3: Legacy hitTest() — 30 columns
-    // Call only from main thread
-    private func m3_hitTest(frame: ARFrame) -> [Float]? {
-        let view   = sceneView
-        let w      = view.bounds.width
-        let midY   = view.bounds.midY
-        let camPos = simd_float3(frame.camera.transform.columns.3.xyz)
-
-        var res = Array(repeating: Float.infinity, count: numScanColumns)
-
+    private func m3_hitTestGrid(frame: ARFrame) -> [Float]? {
+        let view = self.sceneView
+        let bounds = view.bounds
+        if bounds.width == 0 { return nil }
+        
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let camPos = SIMD3<Float>(frame.camera.transform.columns.3.x, 
+                                  frame.camera.transform.columns.3.y, 
+                                  frame.camera.transform.columns.3.z)
+        
+        var scan = Array(repeating: Float.infinity, count: numScanColumns)
+        var hitCount = 0
+        
         for col in 0..<numScanColumns {
-            let pt   = CGPoint(x: CGFloat(col) / CGFloat(numScanColumns) * w,
-                                y: midY)
-            let hits = view.hitTest(pt, types: [.featurePoint])
-            if let hit = hits.first {
-                let hp = simd_float3(hit.worldTransform.columns.3.xyz)
-                let d  = distance(camPos, hp)
-                if d >= minRayDistance && d <= maxRayDistance {
-                    res[col] = d
+            let nx = CGFloat(col) / CGFloat(numScanColumns - 1) * 2.0 - 1.0
+            var colMin = Float.infinity
+            
+            for row in 0..<numRows {
+                let ny = CGFloat(row) / CGFloat(max(1, numRows - 1)) * 2.0 - 1.0
+                let samplePoint = CGPoint(x: center.x + nx * (rayScreenRadius * bounds.width),
+                                          y: center.y + ny * (verticalSpread * bounds.height))
+
+                let results = view.hitTest(samplePoint, types: [.featurePoint, .estimatedHorizontalPlane])
+                if let hit = results.first {
+                    let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x, hit.worldTransform.columns.3.y, hit.worldTransform.columns.3.z)
+                    let d = distance(camPos, hitPos)
+                    if d >= minRayDistance && d <= maxRayDistance {
+                        colMin = min(colMin, d)
+                        hitCount += 1
+                    }
+                }
+            }
+            scan[col] = colMin
+        }
+        if hitCount > 0 { return scan }
+        return nil
+    }
+
+    private func m4_coneFallback(frame: ARFrame) -> [Float] {
+        guard let points = frame.rawFeaturePoints?.points else { 
+            return Array(repeating: 10.0, count: numScanColumns) 
+        }
+
+        let cameraTransform = frame.camera.transform
+        let worldToCamera = cameraTransform.inverse
+        var count = 0
+        var nearestZ: Float? = nil
+
+        for p in points {
+            let worldPoint = simd_float4(p.x, p.y, p.z, 1)
+            let local = simd_mul(worldToCamera, worldPoint)
+
+            if local.z < featurePointNearZ && local.z > featurePointFarZ {
+                if abs(local.x) <= featurePointConeHalfWidth && abs(local.y) <= featurePointConeHalfHeight {
+                    count += 1
+                    if nearestZ == nil || abs(local.z) < nearestZ! {
+                        nearestZ = abs(local.z)
+                    }
                 }
             }
         }
-        return res.contains(where: { $0 != .infinity }) ? res : nil
-    }
 
-    // MARK: - M4: Cone fallback — returns max distance for all columns
-    private func m4_cone() -> [Float] {
-        return Array(repeating: maxRayDistance, count: numScanColumns)
+        let finalDist: Float
+        if count >= featurePointDensityThreshold, let nz = nearestZ {
+            finalDist = max(minRayDistance, min(maxRayDistance, nz))
+        } else {
+            finalDist = 10.0 // Path clear
+        }
+        
+        return Array(repeating: finalDist, count: numScanColumns)
     }
-}
-
-extension simd_float4 {
-    var xyz: simd_float3 { return simd_float3(x, y, z) }
 }
