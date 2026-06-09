@@ -139,13 +139,13 @@ final class ARManager: NSObject, ObservableObject {
         guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
         let buf = baseAddress.assumingMemoryBound(to: Float32.self)
         
-        var scan = Array(repeating: Float.infinity, count: numScanColumns)
+        var scan = Array(repeating: Float(10.0), count: numScanColumns)
         var hitCount = 0
         
         for col in 0..<numScanColumns {
             let nx = Float(col) / Float(numScanColumns - 1) * 2.0 - 1.0
             let px = max(0, min(Int((0.5 + (nx * Float(rayScreenRadius))) * Float(w)), w - 1))
-            var colMin = Float.infinity
+            var colMin = Float(10.0)
             
             for row in 0..<numRows {
                 let ny = Float(row) / Float(max(1, numRows - 1)) * 2.0 - 1.0
@@ -173,12 +173,12 @@ final class ARManager: NSObject, ObservableObject {
         let centerY = bounds.height * verticalCenterOffset 
         let camPos = SIMD3<Float>(frame.camera.transform.columns.3.x, frame.camera.transform.columns.3.y, frame.camera.transform.columns.3.z)
         
-        var scan = Array(repeating: Float.infinity, count: numScanColumns)
+        var scan = Array(repeating: Float(10.0), count: numScanColumns)
         var hitCount = 0
         
         for col in 0..<numScanColumns {
             let nx = CGFloat(col) / CGFloat(numScanColumns - 1) * 2.0 - 1.0
-            var colMin = Float.infinity
+            var colMin = Float(10.0)
             for row in 0..<numRows {
                 let ny = CGFloat(row) / CGFloat(max(1, numRows - 1)) * 2.0 - 1.0
                 // Using centerY instead of bounds.midY
@@ -209,12 +209,12 @@ final class ARManager: NSObject, ObservableObject {
         let centerY = bounds.height * verticalCenterOffset 
         let camPos = SIMD3<Float>(frame.camera.transform.columns.3.x, frame.camera.transform.columns.3.y, frame.camera.transform.columns.3.z)
         
-        var scan = Array(repeating: Float.infinity, count: numScanColumns)
+        var scan = Array(repeating: Float(10.0), count: numScanColumns)
         var hitCount = 0
         
         for col in 0..<numScanColumns {
             let nx = CGFloat(col) / CGFloat(numScanColumns - 1) * 2.0 - 1.0
-            var colMin = Float.infinity
+            var colMin = Float(10.0)
             for row in 0..<numRows {
                 let ny = CGFloat(row) / CGFloat(max(1, numRows - 1)) * 2.0 - 1.0
                 // Using centerY instead of bounds.midY
